@@ -1,164 +1,199 @@
+import asyncio
 import json
 import logging
 import os.path
 import re
+import sys
 import time
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List, Dict
 from typing import Set, Tuple, Union
 
-import xxhash
+import requests
 from celery.result import AsyncResult
 from multidict import CIMultiDictProxy, CIMultiDict
-from pydantic import BaseModel
-from selectolax.parser import HTMLParser, Node
+from pydantic import Field, field_validator
 from tldextract import tldextract
 from usp.tree import sitemap_tree_for_homepage
 
-from aiocrawler import AsyncCrawler
+from asynccrawler import AsyncCrawler, AsyncCrawlerConfig
 from lmdb_collection import LmdbmDocumentCollection
+from siteextractor import do_extraction, ExtractionRules
 
-import urllib.parse as urlparse
-import uuid
-
-from lxml.html.clean import Cleaner
-import requests
-
-global_excludes = {"\\.jpg", "\\.jpeg", "\\.png", "\\.mp4", "\\.webp", "\\.gif", "\\.css", "\\.js"}
 logger = logging.getLogger('SiteCrawler')
 
-is_clean_javascript = True
-is_clean_style = True
-kill_tags = ['noscript','footer', 'header', 'nav', 'button', 'form']
-unstructured_url = 'http://localhost:8005'
 
-class ExtractionRule(BaseModel):
-    field_name: str
-    css: Optional[str] = None
-    regex: Optional[str] = None
-    delimiter: Optional[str] = None
-    attribute: Optional[str] = None
-    fixed_value: Optional[str] = None
-    default_value: Optional[str] = None
+class SiteCrawlerConfig(AsyncCrawlerConfig):
+    name: str
+    allowed_domains: List[str] = Field(default_factory=list)
+    allowed_regex: List[str] = Field(default_factory=list)
+    denied_regex: List[str] = Field(default_factory=list)
+    denied_extensions: List[str] = Field(default_factory=list)
+    allow_urls_by_default: bool = True,
+    headers: Dict[str, str] = Field(default_factory=dict)
+    sitemap_file: Optional[str] = None
+    is_sitemap: bool = False
+    is_sitemap_direct: bool = False
+    if_modified_since_hours: int = -1
+    cache_ttl_hours: float = -1
+    allow_starting_url_hostname: bool = True
+    allow_starting_url_tld: bool = False
+    content_css_selector: Optional[str] = None
+    extraction_rules: Union[ExtractionRules, str, dict] = None
+    user_agent: str = 'SiteCrawler/1.0'
+    data_dir: str = "data"
+    init_collection: bool = True
+    debug_html: bool = False
+    global_excludes: Set[str] = {"\\.jpg", "\\.jpeg", "\\.png", "\\.mp4", "\\.webp", "\\.gif", "\\.css", "\\.js"}
 
+    def __init__(self, **data):
+        # Process starting_urls before calling super().__init__
+        if 'starting_urls' in data and isinstance(data['starting_urls'], str):
+            data['starting_urls'] = [data['starting_urls']]
 
-class ExtractionRules(BaseModel):
-    rules: list[ExtractionRule]
+        super().__init__(**data)
 
-    def compute_hash(self):
-        return xxhash.xxh32_intdigest(json.dumps([k.model_dump_json() for k in self.rules]))
+        for field in ['denied_regex', 'allowed_regex']:
+            value = getattr(self, field)
+            if isinstance(value, str):
+                setattr(self, field, value.split(","))
+        if isinstance(self.allowed_domains, str):
+            self.allowed_domains = self.allowed_domains.split(",")
+        if isinstance(self.denied_extensions, str):
+            self.denied_extensions = self.denied_extensions.split(",")
+
+        if self.user_agent and "User-Agent" not in self.headers:
+            self.headers["User-Agent"] = self.user_agent
+
+        self.denied_regex = self.denied_regex + list(self.global_excludes)
+
+    @field_validator('extraction_rules', mode='before')
+    @classmethod
+    def parse_extraction_rules(cls, v):
+        if v is None:
+            return ExtractionRules(rules=[])
+        if isinstance(v, str):
+            return ExtractionRules.model_validate_json(v)
+        elif isinstance(v, dict):
+            return ExtractionRules.model_validate(v)
+        elif isinstance(v, ExtractionRules):
+            return v
+        else:
+            raise ValueError("Invalid extraction_rules format")
 
 
 class SiteCrawler(AsyncCrawler):
-    timeout = 10
-    max_redirects = 2
-    
+    def __init__(self, config: Optional[SiteCrawlerConfig] = None, **kwargs):
+        if config is None and not kwargs:
+            raise ValueError("Either config or keyword arguments must be provided")
 
-    def __init__(self,
-                 name: str,
-                 starting_urls: list[str],
-                 allowed_domains: list = None,
-                 allowed_regex: list = None,
-                 denied_regex: list = None,
-                 denied_extensions: list = None,
-                 is_sitemap=False,
-                 max_depth: int = 300,
-                 max_pages=-1,
-                 concurrency: int = 10,
-                 max_retries: int = 2,
-                 if_modified_since_hours: int = -1,
-                 cache_ttl_hours: float = -1,
-                 allow_starting_url_hostname=True,
-                 allow_starting_url_tld=False,
-                 headers=None,
-                 content_css_selector: str = None,
-                 extraction_rules: Union[ExtractionRules, str, dict] = None,
-                 user_agent: str = 'SiteCrawler/1.0',
-                 data_dir: str = "data",
-                 init_collection: bool = True
-                 # primarily used for testing purposes to bypass creation of lmdb collection
-                 ) -> None:
-        if (isinstance(starting_urls, str)):
-            starting_urls = [starting_urls]
+        if config is None:
+            config = SiteCrawlerConfig(**kwargs)
+        elif kwargs:
+            config_dict = config.model_dump()
+            config_dict.update(kwargs)
+            config = SiteCrawlerConfig(**config_dict)
 
-        if headers is None:
-            headers = {}
-        if not "User-Agent" in headers:
-            headers["User-Agent"] = user_agent
+        self.config = config
+        self._initialize_starting_urls()
+        super().__init__(self.config)
 
-        if is_sitemap:
-            max_depth = 1
-            leaf_urls = set()
-            for s in starting_urls:
-                logger.info("Fetching sitemap for %s", s)
-                tree = sitemap_tree_for_homepage(s)
-                for page in tree.all_pages():
-                    leaf_urls.add(page.url)
-            super().__init__(starting_urls=list(leaf_urls), max_depth=max_depth,
-                             max_pages=max_pages,
-                             concurrency=concurrency,
-                             max_retries=max_retries, headers=headers)
-        else:
-            super().__init__(starting_urls=starting_urls, max_depth=max_depth, max_pages=max_pages,
-                             concurrency=concurrency,
-                             max_retries=max_retries, headers=headers)
-        if denied_extensions is None:
-            denied_extensions = []
-        if isinstance(denied_extensions, str):
-            denied_extensions = denied_extensions.split(",")
-        if denied_regex is None:
-            denied_regex = []
-        if isinstance(denied_regex, str):
-            denied_regex = denied_regex.split(",")
-        if allowed_regex is None:
-            allowed_regex = list()
-        if isinstance(allowed_regex, str):
-            allowed_regex = allowed_regex.split(",")
-        if allowed_domains is None:
-            allowed_domains = list()
-        if isinstance(allowed_domains, str):
-            allowed_domains = allowed_domains.split(",")
-        if extraction_rules is None:
-            extraction_rules = ExtractionRules(rules=[])
-
-        self.allowed_domains = allowed_domains
-        self.allowed_regex = allowed_regex
-        self.denied_regex = denied_regex + list(global_excludes)
-        self.denied_extensions = denied_extensions
-
-        if isinstance(extraction_rules, str):
-            self.extraction_rules = ExtractionRules.model_validate_json(extraction_rules)
-        elif isinstance(extraction_rules, dict):
-            self.extraction_rules = ExtractionRules.model_validate_json(json.dumps(extraction_rules))
-        elif isinstance(extraction_rules, ExtractionRules):
-            self.extraction_rules = extraction_rules
-
-        self.cache_ttl_hours = cache_ttl_hours
         self.stats = Counter()
-
-        for s in starting_urls:
-            subdomain, tld = self.parse_tld(s)
-            if allow_starting_url_hostname:
-                self.allowed_domains.append(subdomain)
-            if allow_starting_url_tld:
-                self.allowed_domains.append(tld)
-        self.name = name
-        self.max_pages = max_pages
-        self.max_redirects = 30
-        timestamp = time.time()
-        self.start_time = timestamp
+        self.start_time = time.time()
         self.end_time = -1
         self.duration = -1
         self.celery_task: Optional[AsyncResult] = None
 
-        if init_collection:
-            if not os.path.exists(data_dir):
-                os.makedirs(data_dir)
-            self.collection = LmdbmDocumentCollection(data_dir + "/" + self.name + ".crawl")
+        if self.config.init_collection:
+            if not os.path.exists(self.config.data_dir):
+                os.makedirs(self.config.data_dir)
+            self.collection = LmdbmDocumentCollection(f"{self.config.data_dir}/{self.config.name}.crawl")
+
+    def _initialize_starting_urls(self):
+        if self.config.is_sitemap:
+            self._process_sitemap_tree()
+        elif self.config.is_sitemap_direct:
+            self._process_sitemap_direct()
+        elif self.config.sitemap_file:
+            self._process_sitemap_file()
+        else:
+            self._process_starting_urls()
+
+    def _process_sitemap_tree(self):
+        self.config.max_depth = 1
+        leaf_urls = set()
+        for s in self.config.starting_urls:
+            logger.info("Fetching sitemap for %s", s)
+            tree = sitemap_tree_for_homepage(s)
+            for page in tree.all_pages():
+                leaf_urls.add(page.url)
+        self.config.starting_urls = list(leaf_urls)
+
+    def _process_sitemap_direct(self):
+        print("Fetching sitemap direct...")
+        leaf_urls = set()
+        for s in self.config.starting_urls:
+            subdomain, tld = self.parse_tld(s)
+            if self.config.allow_starting_url_hostname and subdomain not in self.config.allowed_domains:
+                self.config.allowed_domains.append(subdomain)
+            if self.config.allow_starting_url_tld and tld not in self.config.allowed_domains:
+                self.config.allowed_domains.append(tld)
+
+            logger.info("Fetching sitemap for %s", s)
+            res = requests.get(s)
+            matches = re.findall(r"<loc>(.*?)</loc>", res.text)
+            for m in matches:
+                if self.valid_link(s, m):
+                    leaf_urls.add(m)
+        self.config.starting_urls = list(leaf_urls)
+
+    def _process_sitemap_file(self):
+        print(f"Loading sitemap from file: {self.config.sitemap_file}")
+        leaf_urls = set()
+        with open(self.config.sitemap_file) as f:
+            s = f.read()
+            matches = re.findall(r"<loc>(.*?)</loc>", s)
+            for m in matches:
+                if self.valid_link(s, m):
+                    leaf_urls.add(m)
+        for s in leaf_urls:
+            print(s)
+        self.config.starting_urls = list(leaf_urls)
+
+    def _process_starting_urls(self):
+        for s in self.config.starting_urls:
+            subdomain, tld = self.parse_tld(s)
+            if self.config.allow_starting_url_hostname and subdomain not in self.config.allowed_domains:
+                self.config.allowed_domains.append(subdomain)
+            if self.config.allow_starting_url_tld and tld not in self.config.allowed_domains:
+                self.config.allowed_domains.append(tld)
 
     def __repr__(self) -> str:
-        return f"SiteCrawler(name={self.name}, starting_urls={self.starting_urls}"
+        return f"SiteCrawler(name={self.config.name}, starting_urls={self.config.starting_urls}"
+
+    @staticmethod
+    def parse_args(args):
+        d = {}
+        for arg in args:
+            if '=' in arg:
+                k, v = arg.lstrip('-').split('=', 1)
+                d[k] = v
+        return d
+
+    @classmethod
+    def from_command_line(cls):
+        args = cls.parse_args(sys.argv[1:])
+
+        if 'config' in args:
+            config_file = args['config']
+            with open(config_file, 'r') as f:
+                config_data = json.load(f)
+            print("SiteCrawler parameters (from config):", config_data)
+            return cls(**config_data)
+        else:
+            print("SiteCrawler parameters:", args)
+            return cls(**args)
 
     @classmethod
     def from_json(cls, json_str: str, **kwargs) -> 'SiteCrawler':
@@ -204,7 +239,7 @@ class SiteCrawler(AsyncCrawler):
         else:
             end_time = datetime.fromtimestamp(self.end_time, timezone.utc).astimezone().strftime(
                 "%Y-%m-%d %H:%M:%S.%f%z (%Z)")
-        return {"name": self.name, "stats": dict(self.stats), "start_time": start_time, "end_time": end_time,
+        return {"name": self.config.name, "stats": dict(self.stats), "start_time": start_time, "end_time": end_time,
                 "duration": self.format_duration(self.duration)}
 
     async def _make_request(self, url: str) -> Tuple[str, str, Union[str, bytes], CIMultiDictProxy[str]]:
@@ -217,10 +252,9 @@ class SiteCrawler(AsyncCrawler):
         self.stats["total"] += 1
 
         if self.is_cached_url(url):
-            # logger.debug("Cached: " + url)
             self.stats["cached"] += 1
             if self.celery_task:
-                self.celery_task.update_state(state='PROGRESS', meta={"name": self.name, "stats": self.stats})
+                self.celery_task.update_state(state='PROGRESS', meta={"name": self.config.name, "stats": self.stats})
             dict = CIMultiDict()
             cached = self.collection[url]
             dict["Last-Modified"] = cached["server_last_modified"]
@@ -239,9 +273,11 @@ class SiteCrawler(AsyncCrawler):
         self.stats["fetched"] += 1
         content_type, actual_url, content, headers = await super()._make_request(url)
         if self.celery_task:
-            self.celery_task.update_state(state='PROGRESS', meta={"name": self.name, "stats": self.stats})
+            self.celery_task.update_state(state='PROGRESS', meta={"name": self.config.name, "stats": self.stats})
         if url != actual_url:
             self.save_redirect(url, actual_url)
+        if self.config.debug_html:
+            print(content)
         return content_type, actual_url, content, headers
 
     def parse_tld(self, url: str) -> tuple[str, str]:
@@ -257,13 +293,14 @@ class SiteCrawler(AsyncCrawler):
         :return:
         """
         subdomain, tld = self.parse_tld(link)
-        if subdomain not in self.allowed_domains and tld not in self.allowed_domains:
+        if len(self.config.allowed_domains) > 0 and subdomain not in self.config.allowed_domains \
+                and tld not in self.config.allowed_domains:
             return False
         if "@" in link:
             return False
 
         included = False
-        for s in self.allowed_regex:
+        for s in self.config.allowed_regex:
             if re.findall(s, link, re.IGNORECASE):
                 included = True
                 break
@@ -271,31 +308,25 @@ class SiteCrawler(AsyncCrawler):
             return True
 
         excluded = False
-        for s in self.denied_regex:
+        for s in self.config.denied_regex:
             if re.findall(s, link, re.IGNORECASE):
                 excluded = True
                 break
         if excluded:
             return False
-        for s in self.denied_extensions:
+        for s in self.config.denied_extensions:
             if link.endswith(s):
                 excluded = True
                 break
         if excluded:
             return False
 
-        # ======================================================
-        # If no regex includes were explicitly specified, then allow all
-        # Otherwise, allow only those explicitly specified
-        # ======================================================
-        # return len(self.allowed_regex) == 0
-
-        return True
+        return self.config.allow_urls_by_default
 
     def is_cached_url(self, url):
         is_cached = url in self.collection and self.collection[url]["type"] == "content"
-        if is_cached and self.cache_ttl_hours > -1:
-            is_cache_expired = (self.start_time - self.collection[url]["crawled"]) / 3600 >= self.cache_ttl_hours
+        if is_cached and self.config.cache_ttl_hours > -1:
+            is_cache_expired = (self.start_time - self.collection[url]["crawled"]) / 3600 >= self.config.cache_ttl_hours
             return not is_cache_expired
         else:
             return is_cached
@@ -333,7 +364,8 @@ class SiteCrawler(AsyncCrawler):
                                              server_last_modified=response_headers.get("Last-Modified"))
                 else:
                     self.collection.add_binary(url, content, content_type, type="content", parsed_hash="",
-                                               crawled=time.time(), server_last_modified=response_headers.get("Last-Modified"))
+                                               crawled=time.time(),
+                                               server_last_modified=response_headers.get("Last-Modified"))
             else:
                 # compare the last modified dates
                 server_last_modified = response_headers.get("Last-Modified")
@@ -360,121 +392,10 @@ class SiteCrawler(AsyncCrawler):
         self.celery_task = current_task
 
 
-def _extract_content(node: Node, rule: ExtractionRule) -> str:
-    if rule.attribute:
-        return node.attributes[rule.attribute].strip()
-    else:
-        return node.text().strip()
-
-
-def do_extract(content: str, rules: ExtractionRules) -> dict:
-    dom = HTMLParser(dom_cleaner(content))
-    result = {}
-    for r in rules.rules:
-        if r.css:
-            results = dom.css(r.css)
-            if len(results) == 0:
-                if r.default_value:
-                    result[r.field_name] = r.default_value
-            if len(results) == 1:
-                result[r.field_name] = _extract_content(results[0], r)
-            elif len(results) > 1:
-                result[r.field_name] = [_extract_content(n, r) for n in results]
-        elif r.regex:
-            matches = re.findall(r.regex, content)
-            if len(matches) > 0:
-                result[r.field_name] = matches[0].strip()
-        elif r.fixed_value:
-            result[r.field_name] = r.fixed_value
-        if r.field_name not in result:
-            result[r.field_name] = ""
-    return result
-
-def _extract_binary_content(result, bytestream):
-    headers = {
-        'accept': 'application/json'
-    }
-    a = urlparse.urlparse(result['uri'])
-    filename = os.path.basename(a.path)
-    files = {
-        'files' : (filename, bytestream),
-        'strategy': (None,'auto')
-    }
-    resp = requests.post(f'{unstructured_url}/general/v0/general', headers=headers, files=files)
-    if resp.status_code == 200:
-        text_blob = ' '.join([line['text'] for line in resp.json()])
-        title = resp.json()[0]['metadata']['filename']
-        result['_content'] = text_blob
-        result['title'] = title
-    return result
-
-
-
-def do_extraction(crawler):
-    if crawler.extraction_rules is None or len(crawler.extraction_rules.rules) == 0:
-        return
-    parsed_hash = crawler.extraction_rules.compute_hash()
-
-    for k, v in crawler.collection.items():
-        if crawler.collection.is_binary_key(k):
-            continue
-        else:
-            if v["type"] == "content" and v["parsed_hash"] != parsed_hash:
-                result = do_extract(v["_content"], crawler.extraction_rules)
-                # Default extraction for Facet on Based on URL
-                result['uri'] = k
-                result['path_s'] = get_path(k)
-                result['typeUrl_s'] = get_type_from_url(k)
-                result['id'] = create_id(k)
-
-                if v['content_type'] != 'text/html':
-                    result = _extract_binary_content(result, crawler.collection.get_binary(k))
-                v.update(result)
-                # print(k, result)
-                v["parsed_hash"] = parsed_hash
-                crawler.collection[k] = v
-
-def dom_cleaner(content):
-    cleaner = Cleaner()
-    cleaner.javascript = is_clean_javascript
-    cleaner.style = is_clean_style
-    cleaner.kill_tags = kill_tags
-
-    return cleaner.clean_html(content)
-
-def create_id(url_string):
-    return str(uuid.uuid3(uuid.NAMESPACE_URL, url_string))
-
-def get_path(url_string):
-    url_parse = urlparse.urlparse(url_string)
-    path_str = url_parse.path.strip('/').replace('/', ' / ')
-    if not path_str:
-        path_str = url_parse.netloc
-    return path_str
-
-def get_type_from_url(url_string):
-    url_parse = urlparse.urlparse(url_string)
-    pagetype = url_parse.path.strip('/').split('/')[0].title()
-    if "-" in pagetype:
-        pagetype = " ".join(pagetype.split("-")).title()
-    if "_" in pagetype:
-        pagetype = " ".join(pagetype.split("_")).title()
-    if not pagetype:
-        return "Web Page"
-    return pagetype
-
 if __name__ == '__main__':
-    import sys
-    import asyncio
-    from collections import defaultdict
+    crawler = SiteCrawler.from_command_line()
 
-    d = defaultdict(list)
-    for k, v in ((k.lstrip('-'), v) for k, v in (a.split('=') for a in sys.argv[1:])):
-        d[k].append(v)
-    for k in (k for k in d if len(d[k]) == 1):
-        d[k] = d[k][0]
-    print("Sitecrawler parameters:", d)
-    crawler = SiteCrawler(**dict(d))
+    # Run the crawler and perform the extraction
     asyncio.run(crawler.get_results())
     print(crawler.stats)
-    do_extraction(crawler)
+    do_extraction(crawler.collection, crawler.config.extraction_rules)

@@ -8,7 +8,7 @@ from sitecrawler import SiteCrawler, ExtractionRules, do_extract
 class TestSiteCrawler(unittest.TestCase):
 
     def test_valid_link_domains(self):
-        crawler = SiteCrawler("testing", starting_urls=["https://www.example.com"], allow_starting_url_tld=True,
+        crawler = SiteCrawler(name="testing", starting_urls=["https://www.example.com"], allow_starting_url_tld=True,
                               allow_starting_url_hostname=True)
         self.assertTrue(crawler.valid_link("https://www.example.com", "https://www.example.com"))
         self.assertTrue(crawler.valid_link("https://www.example.com", "https://www.example.com/index.html"))
@@ -19,7 +19,7 @@ class TestSiteCrawler(unittest.TestCase):
 
         self.assertFalse(crawler.valid_link("https://www.example.com", "https://google.com/index.html"))
 
-        crawler = SiteCrawler("testing", starting_urls=["https://www.example.com"],
+        crawler = SiteCrawler(name="testing", starting_urls=["https://www.example.com"],
                               allow_starting_url_tld=False,
                               allow_starting_url_hostname=True)
         self.assertTrue(crawler.valid_link("https://www.example.com", "https://www.example.com/index.html"))
@@ -27,7 +27,7 @@ class TestSiteCrawler(unittest.TestCase):
         self.assertFalse(crawler.valid_link("https://www.example.com", "https://foo.example.com/index.html"))
         self.assertFalse(crawler.valid_link("https://www.example.com", "https://google.com/index.html"))
 
-        crawler = SiteCrawler("testing", starting_urls=["https://www.example.com"],
+        crawler = SiteCrawler(name="testing", starting_urls=["https://www.example.com"],
                               allow_starting_url_tld=True,
                               allow_starting_url_hostname=False)
         self.assertTrue(crawler.valid_link("https://www.example.com", "https://www.example.com/index.html"))
@@ -35,7 +35,7 @@ class TestSiteCrawler(unittest.TestCase):
         self.assertTrue(crawler.valid_link("https://www.example.com", "https://foo.example.com/index.html"))
         self.assertFalse(crawler.valid_link("https://www.example.com", "https://google.com/index.html"))
 
-        crawler = SiteCrawler("testing", starting_urls=["https://www.example.com"],
+        crawler = SiteCrawler(name="testing", starting_urls=["https://www.example.com"],
                               allowed_domains=["foo.example.com"],
                               allow_starting_url_tld=False,
                               allow_starting_url_hostname=False)
@@ -45,15 +45,17 @@ class TestSiteCrawler(unittest.TestCase):
         self.assertFalse(crawler.valid_link("https://www.example.com", "https://google.com/index.html"))
 
     def test_valid_link_includes_excludes(self):
-        crawler = SiteCrawler("testing", starting_urls=["https://www.example.com"],
+        crawler = SiteCrawler(name="testing", starting_urls=["https://www.example.com"],
                               allowed_regex=[".html$"],
                               denied_regex=[".css$"],
                               )
         self.assertTrue(crawler.valid_link("https://www.example.com", "https://www.example.com/index.html"))
         self.assertFalse(crawler.valid_link("https://www.example.com", "https://www.example.com/index.css"))
 
-        # any link that is not explicitly excluded is allowed as long as it matches domain rules
+        # test default behavior
         self.assertTrue(crawler.valid_link("https://www.example.com", "https://www.example.com/index.htmlsss"))
+        crawler.config.allow_urls_by_default = False
+        self.assertFalse(crawler.valid_link("https://www.example.com", "https://www.example.com/index.htmlsss"))
 
     def test_extract_css(self):
         content = "<html><title>foo</title></html>"
@@ -78,11 +80,11 @@ class TestSiteCrawler(unittest.TestCase):
         self.assertEqual("", do_extract(content, rules)["title"])
 
     def test_cache_expiry(self):
-        crawler = SiteCrawler("testing", [], cache_ttl_hours=-1, init_collection=False)
+        crawler = SiteCrawler(name="testing", starting_urls=[], cache_ttl_hours=-1, init_collection=False)
         crawler.collection = {"foo": {"type": "content"}}
         self.assertTrue(crawler.is_cached_url("foo"))
 
-        crawler = SiteCrawler("testing", [], cache_ttl_hours=0.5, init_collection=False)
+        crawler = SiteCrawler(name="testing", starting_urls=[], cache_ttl_hours=0.5, init_collection=False)
         crawler.collection = {"foo": {"type": "content", "crawled": time.time() - 3600}}
         self.assertFalse(crawler.is_cached_url("foo"))
 

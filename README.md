@@ -25,6 +25,7 @@ It is designed for speed:
 - [x] FastAPI API server
 - [x] Celery integration
 - [x] Dockerized
+- [x] Proxy support
 - [ ] Scheduling crawls
 - [x] Return full downloaded content via /browse API
 - [ ] Standard webpage metadata extractors
@@ -279,22 +280,64 @@ There should only be either `css` or `regex` declared. If both are declared, `cs
 </details>
 
 
+## Using proxy services
+| **Name**                   | **Type**     | **Description**                                         |
+|----------------------------|--------------|---------------------------------------------------------|
+| **proxy_url**              | string       | Proxy service URL (required)                            |
+| **proxy_username**         | string       | Proxy username                                          |
+| **proxy_password**         | string       | Proxy password                                          |
+| **proxy_post_data**        | string       | The JSON payload. Use $URL to signify the URL to fetch. |
+| **proxy_response_to_html** | list[string] | The JSON response path to the HTML.                     |
+| **proxy_base64_decode**    | boolean      | Is the HTML response base64 encoded?                    |
 
+Example settings for Zyte Proxy API:
+```
+  "proxy_username": "[Zyte API Key]",
+  "proxy_password": "",
+  "proxy_url": "https://api.zyte.com/v1/extract",
+  "proxy_post_data": "{\"url\": \"$URL\", \"httpResponseBody\": true}",
+  "proxy_response_to_html": ["httpResponseBody"],
+  "proxy_base64_decode": true,
+```
 
-
+Example settings for OxyLabs Proxy API:
+```
+  "proxy_url": "https://realtime.oxylabs.io/v1/queries",
+  "proxy_username": "[OxyLabs API username]",
+  "proxy_password": "[OxyLabs API password]",
+  "proxy_post_data": "{\"source\": \"universal\", \"url\": \"$URL\", \"geo_location\": \"United States\"}",
+  "proxy_response_to_html": ["results", 0, "content"],
+```
 
 ## Using sitecrawler as a library
 
 ```python
 import asyncio
 
-from sitecrawler import SiteCrawler, do_extraction
+from sitecrawler import SiteCrawler
+from siteextractor import do_extraction
 
 if __name__ == "__main__":
-    crawler = SiteCrawler("test_crawl", ["https://www.supermind.org"], max_pages=10)
+    crawler = SiteCrawler(name="test_crawl", starting_urls=["https://www.supermind.org"], max_pages=10)
     asyncio.run(crawler.get_results())
     print(crawler.stats)
-    do_extraction(crawler)
+    do_extraction(crawler.collection, crawler.config.extraction_rules)
+```
+
+If you prefer, you can also initialize a SiteCrawlerConfig object. 
+```python
+import asyncio
+
+from sitecrawler import SiteCrawler, SiteCrawlerConfig
+from siteextractor import do_extraction
+
+if __name__ == "__main__":
+    config = SiteCrawlerConfig(name="test_crawl", starting_urls=["https://www.supermind.org"], max_pages=10)
+    crawler = SiteCrawler(config=config)
+    asyncio.run(crawler.get_results())
+    print(crawler.stats)
+    do_extraction(crawler.collection, crawler.config.extraction_rules)
+
 ```
 
 ## Using sitecrawler from the command-line
@@ -302,6 +345,20 @@ if __name__ == "__main__":
 source ./venv/bin/activate
 python3 sitecrawler.py --name=supermind --starting_urls="https://www.supermind.org"
 ```
+
+You can also pass in a --config JSON crawl configuration. e.g. if you have a file crawl_config.json
+```json
+{
+  "name": "supermind",
+  "starting_urls": ["https://www.supermind.org"]
+}
+```
+
+You can do this:
+```bash
+python3 sitecrawler.py --config=crawl_config.json
+```
+
 
 ## Running celery locally
 
