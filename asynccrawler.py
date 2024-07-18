@@ -1,17 +1,21 @@
 import asyncio
 import logging
+import ssl
+from base64 import b64decode
 from dataclasses import dataclass
 from typing import Set, List, Tuple, Optional, Union
 from urllib.parse import urljoin, urldefrag
 
+import aiohttp
+import certifi
 from aiohttp import ClientConnectionError, ClientPayloadError
 from aiohttp import ClientSession, ClientResponseError, ClientTimeout
 from aiohttp.client_exceptions import TooManyRedirects
 from multidict import CIMultiDictProxy
+from pydantic import BaseModel
 from selectolax.parser import HTMLParser
 from urllib3.util import create_urllib3_context
-import ssl
-import certifi
+
 # from urllib3 import PoolManager
 
 logger = logging.getLogger('AsyncCrawler')
@@ -39,14 +43,29 @@ class TaskQueueMessage:
     retry_count: int
 
 
+class AsyncCrawlerConfig(BaseModel):
+    starting_urls: List[str]
+    max_depth: int = 1
+    max_pages: int = -1
+    concurrency: int = 100
+    max_retries: int = 2
+    headers: Optional[dict] = None
+    proxy_username: Optional[str] = None
+    proxy_password: Optional[str] = None
+    proxy_url: Optional[str] = None
+    proxy_post_data: Optional[str] = None
+    proxy_response_to_html: Optional[dict] = None
+    proxy_base64_decode: bool = False
+    timeout: int = 30
+    max_redirects: int = 10
+
+
 class AsyncCrawler:
     '''
     Crawler baseclass that concurrently crawls multiple pages till provided depth
     Built on asyncio
     '''
 
-    timeout: int = 30
-    max_redirects: int = 10
     html_content_types: Set[str] = {
         'text/html',
         'text/xhtml',
@@ -62,28 +81,33 @@ class AsyncCrawler:
         'application/epub+zip',
     }
 
-    def __init__(
-            self,
-            starting_urls: list[str],
-            max_depth: int = 1,
-            max_pages: int = -1,
-            concurrency: int = 100,
-            max_retries: int = 2,
-            headers: dict = None,
-    ) -> None:
-        '''
-        Initialize State
-        '''
-        self.starting_urls = starting_urls
-        self.max_depth = max_depth
-        self.max_pages = max_pages
-        self.concurrency = concurrency
-        self.max_retries = max_retries
-        self.headers = headers
+    def __init__(self, config: AsyncCrawlerConfig):
+        self.config = config
         self.crawled_urls: Set[str] = set()
         self.results: List = []
         self.session: Optional[ClientSession] = None
         self.task_queue: Optional[asyncio.Queue] = None
+
+    async def issue_proxy_request(self, url: str):
+        logging.debug("Using proxy", self.config.proxy_url)
+        auth = None
+        if self.config.proxy_username:
+            auth = aiohttp.BasicAuth(self.config.proxy_username, self.config.proxy_password)
+        if self.config.proxy_post_data:
+            if self.config.headers:
+                self.config.headers['Content-Type'] = 'application/json'
+            else:
+                self.config.headers = {'Content-Type': 'application/json'}
+
+            data = self.config.proxy_post_data.replace("$URL", url)
+            async with self.session.post(self.config.proxy_url, auth=auth, headers=self.config.headers, data=data) as response:
+                content = await response.json()
+                for key in self.config.proxy_response_to_html:
+                    content = content[key]
+                if self.config.proxy_base64_code:
+                    content = b64decode(content).decode("utf8")
+                return content, response.headers
+        raise Exception("Unsupported proxy type")
 
     async def _make_request(self, url: str) -> Tuple[
         str, str, Union[str, bytes], CIMultiDictProxy[str, str]]:
@@ -96,17 +120,24 @@ class AsyncCrawler:
             self.session = ClientSession()
 
         logging.debug(f'Fetching: {url}')
-        timeout = ClientTimeout(total=self.timeout)
+        timeout = ClientTimeout(total=self.config.timeout)
 
         ctx = create_urllib3_context(ciphers=":HIGH:!DH:!aNULL", ssl_minimum_version=ssl.TLSVersion.MINIMUM_SUPPORTED)
         ctx.load_verify_locations(cafile=certifi.where())
 
+        if self.config.proxy_url:
+            # Use the proxy request method
+            html, response_headers = await self.issue_proxy_request(url)
+            actual_url = url  # The proxy request does not change the URL
+            content_type = "text/html"  # Assuming the content is HTML, modify as needed
+            return content_type, actual_url, html, response_headers  # No headers from the proxy request
+
         async with self.session.get(
                 url,
-                headers=self.headers,
+                headers=self.config.headers,
                 raise_for_status=True,
                 timeout=timeout,
-                max_redirects=self.max_redirects,
+                max_redirects=self.config.max_redirects,
                 # verify_ssl=False,
                 ssl_context=ctx
         ) as response:
@@ -168,7 +199,7 @@ class AsyncCrawler:
         '''
         Retries a task if max retries not hit
         '''
-        if task.retry_count < self.max_retries:
+        if task.retry_count < self.config.max_retries:
             self.crawled_urls.discard(task.url)
             task_message = TaskQueueMessage(task.source_url, task.url, task.depth, task.retry_count + 1)
             await self.task_queue.put(task_message)
@@ -187,12 +218,12 @@ class AsyncCrawler:
             task = await self.task_queue.get()
             logger.debug(f'Working on {task.url} at {task.depth}')
 
-            if (task.depth >= self.max_depth) or (task.url in self.crawled_urls):
+            if (task.depth >= self.config.max_depth) or (task.url in self.crawled_urls):
                 self.task_queue.task_done()
                 logger.debug('Max depth reached')
                 continue
 
-            if (self.max_pages > 0) and (len(self.crawled_urls) > self.max_pages):
+            if (self.config.max_pages > 0) and (len(self.crawled_urls) > self.config.max_pages):
                 self.task_queue.task_done()
                 logger.debug('Max pages reached')
                 continue
@@ -247,10 +278,10 @@ class AsyncCrawler:
         Starts concurrent workers and kickstarts scraping
         '''
         self.task_queue = asyncio.Queue()
-        for url in self.starting_urls:
+        for url in self.config.starting_urls:
             task_message = TaskQueueMessage(url, url, 0, 0)
             self.task_queue.put_nowait(task_message)
-        workers = [asyncio.create_task(self.worker()) for i in range(self.concurrency)]
+        workers = [asyncio.create_task(self.worker()) for i in range(self.config.concurrency)]
 
         await self.task_queue.join()
 
