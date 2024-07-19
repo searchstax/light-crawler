@@ -379,6 +379,7 @@ You will also need Redis running locally.
 The 4 files of interest are:
 
 - sitecrawler.py: the main crawler logic
-- aiocrawler.py: the crawler base class that handles most of the async fetching operations
+- asynccrawler.py: the crawler base class that handles most of the async fetching operations
+- siteextractor.py: the logic that handles extraction
 - main.py: the FastAPI wrapper around the crawler
 - tasks.py: submits jobs to celery
