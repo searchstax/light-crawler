@@ -48,7 +48,7 @@ class AsyncCrawlerConfig(BaseModel):
     starting_urls: List[str]
     max_depth: int = -1
     max_pages: int = -1
-    concurrency: int = 100
+    concurrency: int = 10
     max_retries: int = 2
     headers: Optional[dict] = None
     proxy_username: Optional[str] = None
