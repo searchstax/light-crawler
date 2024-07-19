@@ -11,6 +11,7 @@ import certifi
 from aiohttp import ClientConnectionError, ClientPayloadError
 from aiohttp import ClientSession, ClientResponseError, ClientTimeout
 from aiohttp.client_exceptions import TooManyRedirects
+from aiohttp_client_rate_limiter.ClientSession import RateLimitedClientSession
 from multidict import CIMultiDictProxy
 from pydantic import BaseModel
 from selectolax.parser import HTMLParser
@@ -45,7 +46,7 @@ class TaskQueueMessage:
 
 class AsyncCrawlerConfig(BaseModel):
     starting_urls: List[str]
-    max_depth: int = 1
+    max_depth: int = -1
     max_pages: int = -1
     concurrency: int = 100
     max_retries: int = 2
@@ -58,6 +59,7 @@ class AsyncCrawlerConfig(BaseModel):
     proxy_base64_decode: bool = False
     timeout: int = 30
     max_redirects: int = 10
+    max_requests_per_second: int = 1000
 
 
 class AsyncCrawler:
@@ -100,7 +102,8 @@ class AsyncCrawler:
                 self.config.headers = {'Content-Type': 'application/json'}
 
             data = self.config.proxy_post_data.replace("$URL", url)
-            async with self.session.post(self.config.proxy_url, auth=auth, headers=self.config.headers, data=data) as response:
+            async with self.session.post(self.config.proxy_url, auth=auth, headers=self.config.headers,
+                                         data=data) as response:
                 content = await response.json()
                 for key in self.config.proxy_response_to_html:
                     content = content[key]
@@ -116,13 +119,22 @@ class AsyncCrawler:
         :param url: the url to fetch
         :return: tuple of actual url (if redirected) and html
         """
+
         if not self.session:
-            self.session = ClientSession()
+            if (self.config.max_requests_per_second > -1):
+                self.session = RateLimitedClientSession(
+                    max_concur=self.config.concurrency,
+                    reqs_per_period=self.config.max_requests_per_second,
+                    period_in_secs=1
+                )
+            else:
+                self.session = ClientSession()
 
         logging.debug(f'Fetching: {url}')
         timeout = ClientTimeout(total=self.config.timeout)
 
-        ctx = create_urllib3_context(ciphers=":HIGH:!DH:!aNULL", ssl_minimum_version=ssl.TLSVersion.MINIMUM_SUPPORTED)
+        ctx = create_urllib3_context(ciphers=":HIGH:!DH:!aNULL",
+                                     ssl_minimum_version=ssl.TLSVersion.MINIMUM_SUPPORTED)
         ctx.load_verify_locations(cafile=certifi.where())
 
         if self.config.proxy_url:
@@ -218,9 +230,14 @@ class AsyncCrawler:
             task = await self.task_queue.get()
             logger.debug(f'Working on {task.url} at {task.depth}')
 
-            if (task.depth >= self.config.max_depth) or (task.url in self.crawled_urls):
+            if (self.config.max_depth > -1 and task.depth >= self.config.max_depth):
                 self.task_queue.task_done()
                 logger.debug('Max depth reached')
+                continue
+
+            if (task.url in self.crawled_urls):
+                self.task_queue.task_done()
+                logger.debug('Already seen URL')
                 continue
 
             if (self.config.max_pages > 0) and (len(self.crawled_urls) > self.config.max_pages):

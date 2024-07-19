@@ -16,3 +16,4 @@ ultimate-sitemap-parser==0.5
 xxhash==3.4.1
 pytest==8.0.0
 lxml==5.1.0
+aiohttp_client_rate_limiter==1.0.3
