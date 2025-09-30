@@ -41,7 +41,7 @@ class SiteCrawlerConfig(AsyncCrawlerConfig):
     allow_starting_url_tld: bool = False
     content_css_selector: Optional[str] = None
     extraction_rules: Union[ExtractionRules, str, dict] = None
-    user_agent: str = 'SiteCrawler/1.0'
+    user_agent: str = 'SearchStax SiteCrawler/1.0'
     data_dir: str = "data"
     init_collection: bool = True
     debug_html: bool = False
