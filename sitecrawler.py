@@ -110,6 +110,11 @@ class SiteCrawler(AsyncCrawler):
                 os.makedirs(self.config.data_dir)
             self.collection = LmdbmDocumentCollection(f"{self.config.data_dir}/{self.config.name}.crawl")
 
+    def queue_backlog(self) -> int:
+        if self.task_queue is None:
+            return 0
+        return self.task_queue.qsize()
+
     def _initialize_starting_urls(self):
         if self.config.is_sitemap:
             self._process_sitemap_tree()
@@ -254,7 +259,14 @@ class SiteCrawler(AsyncCrawler):
         if self.is_cached_url(url):
             self.stats["cached"] += 1
             if self.celery_task:
-                self.celery_task.update_state(state='PROGRESS', meta={"name": self.config.name, "stats": self.stats})
+                self.celery_task.update_state(
+                    state='PROGRESS',
+                    meta={
+                        "name": self.config.name,
+                        "stats": self.stats,
+                        "queue_backlog": self.queue_backlog()
+                    }
+                )
             dict = CIMultiDict()
             cached = self.collection[url]
             dict["Last-Modified"] = cached["server_last_modified"]
@@ -266,6 +278,15 @@ class SiteCrawler(AsyncCrawler):
             dict = CIMultiDict()
             cached = self.collection[actual_url]
             dict["Last-Modified"] = cached["server_last_modified"]
+            if self.celery_task:
+                self.celery_task.update_state(
+                    state='PROGRESS',
+                    meta={
+                        "name": self.config.name,
+                        "stats": self.stats,
+                        "queue_backlog": self.queue_backlog()
+                    }
+                )
             return cached["content_type"], actual_url, cached["_content"], CIMultiDictProxy(dict)
         else:
             print(f"Fetching {url}")
@@ -273,7 +294,14 @@ class SiteCrawler(AsyncCrawler):
         self.stats["fetched"] += 1
         content_type, actual_url, content, headers = await super()._make_request(url)
         if self.celery_task:
-            self.celery_task.update_state(state='PROGRESS', meta={"name": self.config.name, "stats": self.stats})
+            self.celery_task.update_state(
+                state='PROGRESS',
+                meta={
+                    "name": self.config.name,
+                    "stats": self.stats,
+                    "queue_backlog": self.queue_backlog()
+                }
+            )
         if url != actual_url:
             self.save_redirect(url, actual_url)
         if self.config.debug_html:

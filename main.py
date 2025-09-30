@@ -28,7 +28,13 @@ async def submit_crawl(data: dict = Body(...)):
 @app.get("/crawl/{job_id}")
 async def crawl_status(job_id: str):
     job = celery.AsyncResult(job_id)
-    return {"id": job_id, "status": job.status, "info": job.info}
+    info = job.info
+    queue_backlog = None
+    if isinstance(info, dict):
+        queue_backlog = info.get("queue_backlog")
+    if queue_backlog is None and job.status in {"SUCCESS", "FAILURE", "REVOKED"}:
+        queue_backlog = 0
+    return {"id": job_id, "status": job.status, "info": info, "queue_backlog": queue_backlog}
 
 
 @app.delete("/crawl/{job_id}")
